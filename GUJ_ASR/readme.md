@@ -1,161 +1,121 @@
-# 🗣️ Gujarati ASR — SPRING-INX Streaming Model
-### Edge Deployment Pipeline (Android / Raspberry Pi)
+# 🗣️ Gujarati ASR — GUJ_ASR
 
----
-
-## 📌 Project Overview
-
-This project exports the **SPRING-INX Gujarati Streaming ASR model** (originally a monolithic TorchScript `.pt` file) into three separate inference modules optimized for edge devices. The architecture is a **streaming RNN-T Transducer** with a **Zipformer encoder**, designed for real-time chunk-by-chunk speech recognition.
-
-**Source Model:** `SPRING_INX_streaming_k2_Gujarati.pt`  
-**Target Platforms:** Android (PyTorch Mobile), Raspberry Pi (PyTorch CPU)  
+**Part of:** [ASR_IIIT-H](https://github.com/1nisharg/ASR_IIIT-H) — Multi-Language ASR Export Pipeline  
 **Language:** Gujarati (`gu`)  
-**Vocabulary Size:** 900 tokens (BPE)
+**Architecture:** Streaming Zipformer RNN-T (k2 / icefall)  
+**Source:** SPRING-INX / IIT Madras ASR Group
 
 ---
 
-## 📁 Repository Structure
+## 📁 Folder Contents
 
 ```
-gujarati-asr/
-│
-├── models/                          # Exported model files
-│   ├── encoder.ptl                  # Encoder — PyTorch Mobile Lite
-│   ├── decoder.ptl                  # Decoder — PyTorch Mobile Lite
-│   ├── joiner.ptl                   # Joiner  — PyTorch Mobile Lite
-│   └── init_states.pt               # Encoder initial states (98 tensors)
-│
-├── tokens/
-│   └── SPRING_INX_Gujarati_tokens.txt   # 903-entry BPE vocabulary
-│
-├── notebooks/
-│   └── gujarati_asr_export.ipynb    # Full export + verification notebook (Kaggle)
-│
-├── android/
-│   └── GujaratiASR.kt               # Android inference class (PyTorch Mobile)
-│
-├── python/
-│   └── transcribe.py                # Python inference script (Raspberry Pi / testing)
-│
-└── README.md
+GUJ_ASR/
+├── encoder.ptl        # Streaming Zipformer encoder (PyTorch Mobile Lite, ~280MB)
+├── decoder.ptl        # RNN-T decoder (PyTorch Mobile Lite)
+├── joiner.ptl         # RNN-T joiner (PyTorch Mobile Lite)
+└── init_states.pt     # 98 encoder initial state tensors
 ```
+
+> All `.ptl` files are tracked via **Git LFS**.
 
 ---
 
-## 🏗️ Model Architecture
+## 🏗️ Architecture at a Glance
 
 ```
-Audio (16kHz PCM)
+Audio (16kHz) → Kaldi FBank (80-dim) → Chunked [77 frames]
       │
       ▼
-  Kaldi FBank (80-dim mel, 25ms window, 10ms shift)
+  encoder.ptl   [1, 77, 80] + 98 states → [1, 16, 512] + 98 new states
       │
       ▼
-  encoder_embed  [B, 77, 80] → [B, 32, 192]
+  decoder.ptl   [1, 2] (last 2 tokens) → [1, 1, 512]
       │
       ▼
-  Streaming Zipformer Encoder
-      │  Input:  [B, 77, 80]  + 98 state tensors
-      │  Output: [B, 16, 512] + 98 new state tensors
+  joiner.ptl    enc[1,512] + dec[1,512] → logits[1, 900]
+      │
       ▼
-  Decoder (Embedding + Linear)
-      │  Input:  [B, 2]  (last 2 token context)
-      │  Output: [B, 1, 512]
-      ▼
-  Joiner (project + tanh + linear)
-      │  Input:  enc [B, 512] + dec [B, 512]
-      │  Output: logits [B, 900]
-      ▼
-  Greedy / Beam Search → Token IDs → Text
+  Greedy Search → Token IDs → Gujarati Text
 ```
-
----
-
-## ⚙️ Architecture Constants
 
 | Parameter | Value |
 |---|---|
 | Sample Rate | 16000 Hz |
-| Mel Filterbanks | 80 |
+| Mel Bins | 80 |
 | Frame Length | 25ms |
 | Frame Shift | 10ms |
-| Chunk Frames (input) | 77 |
+| Input Chunk Frames | 77 |
 | Encoder Output Frames | 16 per chunk |
 | Encoder Dim | 512 |
 | Decoder Context Size | 2 |
-| Vocabulary Size | 900 |
+| Vocabulary Size | 900 BPE tokens |
 | Blank Token ID | 0 |
-| Number of Encoder States | 98 |
+| Encoder State Count | 98 |
 
 ---
 
-## ⚠️ Critical Notes for Future Developers
+## ⚠️ Critical Notes
 
-### 1. Mel Feature Extraction — NO CMVN
-The model was trained with **raw Kaldi FBank features — no CMVN (mean normalization)**. Applying any normalization (mean subtraction, standardization) will cause the model to output only blanks. Always use:
+### ❌ DO NOT apply CMVN / mean normalization to mel features
+This is the single most important thing. The model was trained on **raw Kaldi FBank features with no normalization**. Applying mean subtraction or standardization will cause the model to output only blanks.
 
 ```python
-import torchaudio.compliance.kaldi as kaldi
+# ✅ CORRECT
+mel = kaldi.fbank(waveform, num_mel_bins=80, ...)
+# use mel as-is — no normalization
 
-mel = kaldi.fbank(
-    waveform,
-    num_mel_bins=80,
-    frame_length=25.0,
-    frame_shift=10.0,
-    high_freq=8000,
-    low_freq=20,
-    sample_frequency=16000,
-    use_energy=False,
-)
-# DO NOT normalize mel features
+# ❌ WRONG — will break everything
+mel = mel - mel.mean()
 ```
 
-### 2. Encoder States Must Be Carried Between Chunks
-The encoder is **stateful**. The 98 state tensors output from one chunk must be fed as input to the next chunk. Resetting states mid-utterance will break transcription. Only reset states between separate utterances.
+### ✅ Carry encoder states between chunks
+The encoder is stateful. Feed the 98 output states of chunk `n` as input states to chunk `n+1`. Reset only between utterances.
 
-### 3. Decoder `need_pad=False`
-Always call the decoder with `need_pad=False` during inference:
+### ✅ Decoder — always `need_pad=False`
 ```python
-dec_out = decoder(y, need_pad=False)   # Python
-decoder(y, torch.tensor(False))        # PTL on Android
+dec_out = decoder(y, torch.tensor(False))
 ```
 
-### 4. Joiner `project_input=True`
-Always call the joiner with `project_input=True` and **2D inputs** `[B, 512]`:
+### ✅ Joiner — always `project_input=True`, inputs must be 2D `[B, 512]`
 ```python
-logits = joiner(enc_frame, dec_frame, project_input=True)
+logits = joiner(enc_frame, dec_frame, True)
 ```
 
-### 5. Init States
-On Android/edge devices, load init states from `init_states.pt` — do NOT try to call `model.encoder.get_init_states()` on a `.ptl` file as submodule access is not available after mobile optimization.
+### ✅ Init states — load from `init_states.pt`
+The `.ptl` files cannot call `get_init_states()` after mobile optimization. Always load from the saved file:
+```python
+state_dict = torch.load("init_states.pt")
+states = [state_dict[f"state_{i}"] for i in range(98)]
+```
 
 ---
 
-## 🐍 Python Inference (Raspberry Pi / Testing)
+## 🐍 Python Inference (Testing / Raspberry Pi)
 
-### Requirements
+### Install
 ```bash
 pip install torch torchaudio
 ```
 
-### Quick Test
+### Run
 ```python
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 import torch
 
 # Load models
-encoder = torch.jit.load("models/encoder.ptl", map_location="cpu")
-decoder = torch.jit.load("models/decoder.ptl", map_location="cpu")
-joiner  = torch.jit.load("models/joiner.ptl",  map_location="cpu")
+encoder = torch.jit.load("encoder.ptl", map_location="cpu")
+decoder = torch.jit.load("decoder.ptl", map_location="cpu")
+joiner  = torch.jit.load("joiner.ptl",  map_location="cpu")
 encoder.eval(); decoder.eval(); joiner.eval()
 
-# Load tokens
-with open("tokens/SPRING_INX_Gujarati_tokens.txt") as f:
+# Load vocab
+with open("SPRING_INX_Gujarati_tokens.txt") as f:
     tokens = [line.strip().split()[0] for line in f]
 
 # Load init states
-state_dict = torch.load("models/init_states.pt")
+state_dict = torch.load("init_states.pt")
 states     = [state_dict[f"state_{i}"] for i in range(98)]
 
 def transcribe(audio_path):
@@ -165,10 +125,12 @@ def transcribe(audio_path):
     if waveform.shape[0] > 1:
         waveform = waveform.mean(0, keepdim=True)
 
+    # Kaldi FBank — NO normalization
     mel = kaldi.fbank(waveform, num_mel_bins=80, frame_length=25.0,
                       frame_shift=10.0, high_freq=8000, low_freq=20,
                       sample_frequency=16000, use_energy=False)
 
+    # Chunk into 77-frame pieces
     CHUNK = 77
     pad   = (-mel.shape[0]) % CHUNK
     if pad:
@@ -182,8 +144,8 @@ def transcribe(audio_path):
             x_lens = torch.tensor([77], dtype=torch.int32)
 
             enc_out_tuple = encoder(x, x_lens, *states)
-            enc_out = enc_out_tuple[0]
-            states[:]  = list(enc_out_tuple[2:])
+            enc_out  = enc_out_tuple[0]
+            states[:]= list(enc_out_tuple[2:])
 
             for t in range(enc_out.shape[1]):
                 y         = torch.tensor([[hyp[-2], hyp[-1]]], dtype=torch.int64)
@@ -203,54 +165,41 @@ def transcribe(audio_path):
     )
     return text.strip()
 
-print(transcribe("your_audio.wav"))
+print(transcribe("your_gujarati_audio.wav"))
 ```
 
 ---
 
 ## 🤖 Android Setup
 
-### 1. `build.gradle.kts` dependency
+### `build.gradle.kts`
 ```kotlin
 implementation("org.pytorch:pytorch_android_lite:1.13.1")
 ```
 
-### 2. Assets
-Place in `app/src/main/assets/`:
-- `encoder.ptl`
-- `decoder.ptl`
-- `joiner.ptl`
-- `init_states.pt`
-- `SPRING_INX_Gujarati_tokens.txt`
+### Assets — place in `app/src/main/assets/`
+```
+encoder.ptl
+decoder.ptl
+joiner.ptl
+init_states.pt
+SPRING_INX_Gujarati_tokens.txt
+```
 
-### 3. Inference Class
-See `android/GujaratiASR.kt` for the complete inference implementation.
-
-> **Note:** The Android Kotlin mel frontend (Kaldi FBank equivalent) still needs to be implemented. Options: use `TarsosDSP` library or implement the filterbank manually. This is the next TODO for the Android developer.
-
----
-
-## 📊 Export Pipeline Summary
-
-The export was done on Kaggle (GPU T4 x2) using the following steps:
-
-| Step | Description | Status |
-|---|---|---|
-| 1 | Load original `.pt` TorchScript model | ✅ |
-| 2 | Scrape architecture constants via forward pass | ✅ |
-| 3 | Export `decoder.onnx` | ✅ (not used, see note) |
-| 4 | Export `joiner.onnx` | ✅ (not used, see note) |
-| 5 | Trace encoder with `EncoderTraceWrapper` | ✅ |
-| 6 | Export all 3 as `.ptl` via PyTorch Mobile | ✅ |
-| 7 | Verify pipeline produces Gujarati text | ✅ `'કેમ છો'` |
-
-> **Note on ONNX:** Encoder ONNX export was attempted but blocked by `prim::TupleIndex` with non-constant index inside the Zipformer IR — a known limitation of both legacy and dynamo ONNX exporters with this architecture. PyTorch Mobile `.ptl` is the recommended format for this model.
+### TODO for Android developer
+- [ ] Implement Kaldi FBank mel extraction in Kotlin (no CMVN)
+- [ ] Load `init_states.pt` tensors on app start
+- [ ] Wire microphone → mel → encoder → decoder → joiner → text
+- [ ] See `GujaratiASR.kt` for the inference skeleton
 
 ---
 
-## 🔬 Verified Test Result
+## ✅ Verified Results
 
-**Input:** `guj.wav` (3.07s Gujarati speech)  
-**Output:** `કેમ છો`  
-**Pipeline:** Original model submodules → confirmed working  
-**PTL Pipeline:** encoder.ptl + decoder.ptl + joiner.ptl → confirmed identical outputs  
+| Test | Result |
+|---|---|
+| Source model | `SPRING_INX_streaming_k2_Gujarati.pt` |
+| Test audio | `guj.wav` (3.07s Gujarati speech) |
+| Transcript | `કેમ છો` |
+| PTL vs original max diff | `0.000000` ✅ |
+| Platform tested | Kaggle CPU (Python) |
